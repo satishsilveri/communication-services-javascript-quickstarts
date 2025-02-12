@@ -10,15 +10,17 @@ import {
 } from "@azure/communication-call-automation";
 import { PhoneNumberIdentifier } from "@azure/communication-common";
 import WebSocket from 'ws';
-import { startConversation, initWebsocket } from './azureOpenAiService'
+import { startConversation, initWebsocket, initAudioData, initCallerId, audioData } from './azureOpenAiService'
 import { processWebsocketMessageAsync } from './mediaStreamingHandler'
+import { v4 as uuidv4 } from 'uuid';
+
+const fs = require('fs');
 
 config();
 
 const PORT = process.env.PORT;
 const WS_PORT = process.env.WS_PORT;
 const app: Application = express();
-
 
 const server = http.createServer(app);
 
@@ -31,6 +33,45 @@ let callConnection: CallConnection;
 let serverCallId: string;
 let callee: PhoneNumberIdentifier;
 let acsClient: CallAutomationClient;
+
+// Function to collate base64 audio data
+function collateBase64Audio(audioList) {
+
+	console.log('before', audioList.slice(0,10))
+
+	//sort audio data based on timestamp
+	audioList.sort((a, b) => a.timeStamp - b.timeStamp);
+
+	// Concatenate the base64 strings in sorted order
+  	return audioList.map(item => item.audio).join(''); 
+}
+
+
+function saveBase64AsAudioFile(base64String, filename) {
+	// Remove any base64 prefix (optional, if it exists)
+	const base64Data = base64String.split(',')[1] || base64String;
+
+	fs.writeFile('calltext.txt', base64Data, (err) => {
+		if (err) {
+		  console.error('Error saving file:', err);
+		} else {
+		  console.log('File saved successfully!');
+		}
+	  });
+  
+	// Convert the base64 string to a Buffer
+	const buffer = Buffer.from(base64Data, 'base64');
+  
+	// Write the buffer to a file
+	fs.writeFile(filename, buffer, (err) => {
+	  if (err) {
+		console.error('Error saving file:', err);
+	  } else {
+		console.log('File saved successfully!');
+	  }
+	});
+}
+
 
 async function createAcsClient() {
 	const connectionString = process.env.CONNECTION_STRING || "";
@@ -47,7 +88,8 @@ async function createOutboundCall() {
 	};
 
 	//const websocketUrl = process.env.CALLBACK_URI.replace(/^https:\/\//, 'wss://');
-	const websocketUrl = process.env.WEBSOCKET_URL
+	const uuid = uuidv4();
+	const websocketUrl = `${process.env.WEBSOCKET_URL}?callerId=${uuid}`
 	console.log(websocketUrl);
 
 	const mediaStreamingOptions: MediaStreamingOptions = {
@@ -103,7 +145,10 @@ app.post("/api/callbacks", async (req: any, res: any) => {
 		console.log(`Message:->${eventData.resultInformation.message}`);
 	}
 	else if (event.type === "Microsoft.Communication.CallDisconnected") {
-		hangUpCall()
+		console.log('Call Disconnected');
+		let audioDataString = collateBase64Audio(audioData);
+		saveBase64AsAudioFile(audioDataString, "call.mp3")
+		//hangUpCall()
 	}
 
 	res.sendStatus(200);
@@ -126,14 +171,18 @@ app.get('/outboundCall', async (req, res) => {
 });
 
 const wss = new WebSocket.Server({ port: WS_PORT });
-wss.on('connection', async (ws: WebSocket) => {
+wss.on('connection', async (ws: WebSocket, req : Request) => {
 	console.log('Client connected!');
+	let callerId = req.url.split("?callerId=")[1]
+	console.log('Caller ID:', callerId);
 	await initWebsocket(ws);
+	await initAudioData([])
+	await initCallerId(callerId);
 	await startConversation()
 	ws.on('message', async (packetData: ArrayBuffer) => {
 		try {
 			if (ws.readyState === WebSocket.OPEN) {
-				await processWebsocketMessageAsync(packetData);
+				await processWebsocketMessageAsync(packetData, callerId);
 			} else {
 				console.warn(`ReadyState: ${ws.readyState}`);
 			}
